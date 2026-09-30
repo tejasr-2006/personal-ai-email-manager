@@ -3,7 +3,15 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from routes.email_routes import router as email_router
 
-app = FastAPI(title="Personal AI Email Manager")
+
+app = FastAPI(
+    title="Personal AI Email Manager"
+)
+
+
+# ============================================================
+# CORS
+# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -13,8 +21,17 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ============================================================
+# EMAIL ROUTES
+# ============================================================
+
 app.include_router(email_router)
 
+
+# ============================================================
+# HOME
+# ============================================================
 
 @app.get("/")
 def home():
@@ -22,8 +39,13 @@ def home():
         "message": "Personal AI Email Manager is running"
     }
 
-@app.get("/health")
-def health():
+
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
+@app.get("/healthz")
+def healthz():
     return {
         "status": "healthy",
         "service": "Personal AI Email Manager"
