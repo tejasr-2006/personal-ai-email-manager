@@ -21,3 +21,10 @@ def home():
     return {
         "message": "Personal AI Email Manager is running"
     }
+
+@app.get("/health")
+def health():
+    return {
+        "status": "healthy",
+        "service": "Personal AI Email Manager"
+    }

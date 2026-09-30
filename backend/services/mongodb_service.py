@@ -1,5 +1,4 @@
 import os
-import certifi
 from pathlib import Path
 from pymongo import MongoClient
 from dotenv import load_dotenv
@@ -17,8 +16,6 @@ if not MONGODB_URI:
 
 client = MongoClient(
     MONGODB_URI,
-    tls=True,
-    tlsCAFile=certifi.where(),
     serverSelectionTimeoutMS=10000
 )
 
