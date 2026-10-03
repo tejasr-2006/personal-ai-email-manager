@@ -1,0 +1,26 @@
+# Render Blueprint (optional). Secrets are NOT stored here: `sync: false`
+# means Render asks you to type each value in its dashboard.
+services:
+  - type: web
+    name: personal-ai-email-manager-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.3
+      - key: ENVIRONMENT
+        value: production
+      - key: MONGODB_URI
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GOOGLE_TOKEN_JSON
+        sync: false
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: API_KEY
+        sync: false

@@ -68,3 +68,7 @@ An AI-powered email management system that connects to Gmail, analyzes emails us
                   │  React Frontend │
                   │    Dashboard    │
                   └─────────────────┘
+
+## 🚀 Running & deploying the backend
+
+See [`backend/README.md`](backend/README.md) for local setup, environment variables, Gmail OAuth and Render deployment.

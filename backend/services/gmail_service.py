@@ -1,308 +1,298 @@
-import os
-import base64
-from pathlib import Path
+"""
+Gmail integration (Gmail API + OAuth).
 
+How authentication works
+------------------------
+* The browser-based OAuth login is done ONCE on your own computer with
+  `python scripts/gmail_auth.py`. That creates `token.json`.
+* The running server only loads that token (from the GOOGLE_TOKEN_JSON
+  environment variable or from the token file) and refreshes it silently.
+* The server never opens a browser, so it can run safely on Render.
+
+This module only talks to Gmail. Saving to MongoDB and AI classification
+happen in `sync_service.py`.
+"""
+
+import base64
+import json
+import os
+import re
+import threading
+from datetime import datetime, timezone
+from email.utils import parseaddr
+from typing import Any, Dict, List, Optional
+
+import google_auth_httplib2
+import httplib2
+from google.auth.exceptions import GoogleAuthError, RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
+from config.settings import settings
 from utils.email_cleaner import clean_email_body
-from services.mongodb_service import save_email
-from services.ai_service import classify_email
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+# gmail.modify is needed so we can mark messages as read in Gmail too.
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+
+HTTP_TIMEOUT_SECONDS = 30
+PAGE_SIZE = 100  # Gmail's maximum per list request
 
 
-# ============================================================
-# PATH CONFIGURATION
-# ============================================================
-
-BASE_DIR = Path(__file__).resolve().parents[2]
-
-CREDENTIALS_FILE = os.getenv(
-    "GOOGLE_CREDENTIALS_FILE",
-    str(BASE_DIR / "credentials.json")
-)
-
-TOKEN_FILE = os.getenv(
-    "GOOGLE_TOKEN_FILE",
-    str(BASE_DIR / "token.json")
-)
+class GmailAuthError(Exception):
+    """Gmail is not authorised (or the token was revoked / expired)."""
 
 
-# ============================================================
-# GMAIL CONFIGURATION
-# ============================================================
+class GmailAPIError(Exception):
+    """Gmail answered with an error. `status` is the HTTP status if known."""
 
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.modify"
-]
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
 
 
-# ============================================================
-# GMAIL SERVICE
-# ============================================================
+# ----------------------------------------------------------------------
+# credentials
+# ----------------------------------------------------------------------
+
+_creds: Optional[Credentials] = None
+_creds_lock = threading.Lock()
+
+
+def is_configured() -> bool:
+    """True if a token is available (does not call Google)."""
+    return bool(settings.GOOGLE_TOKEN_JSON) or os.path.isfile(settings.GOOGLE_TOKEN_FILE)
+
+
+def _load_token() -> Optional[Credentials]:
+    try:
+        if settings.GOOGLE_TOKEN_JSON:
+            return Credentials.from_authorized_user_info(json.loads(settings.GOOGLE_TOKEN_JSON), SCOPES)
+        if os.path.isfile(settings.GOOGLE_TOKEN_FILE):
+            return Credentials.from_authorized_user_file(settings.GOOGLE_TOKEN_FILE, SCOPES)
+    except (ValueError, KeyError, OSError) as exc:
+        logger.error("Gmail token could not be read: %s", type(exc).__name__)
+    return None
+
+
+def get_credentials() -> Credentials:
+    """Return valid credentials, refreshing them if needed. Raises GmailAuthError."""
+    global _creds
+
+    with _creds_lock:
+        if _creds is None:
+            _creds = _load_token()
+
+        if _creds is None:
+            raise GmailAuthError(
+                "Gmail is not authorised yet. Run `python scripts/gmail_auth.py` locally, "
+                "then provide the token via GOOGLE_TOKEN_JSON (or GOOGLE_TOKEN_FILE)."
+            )
+
+        if not _creds.valid:
+            if _creds.refresh_token:
+                try:
+                    _creds.refresh(Request())
+                    logger.info("Gmail access token refreshed.")
+                except RefreshError as exc:
+                    _creds = None
+                    logger.error("Gmail token refresh failed: %s", type(exc).__name__)
+                    raise GmailAuthError(
+                        "Gmail authorisation expired or was revoked. "
+                        "Run `python scripts/gmail_auth.py` again and update the token."
+                    ) from exc
+                except GoogleAuthError as exc:
+                    raise GmailAuthError("Could not refresh the Gmail token.") from exc
+            else:
+                _creds = None
+                raise GmailAuthError("Gmail token has no refresh token. Re-run scripts/gmail_auth.py.")
+
+        return _creds
+
 
 def get_gmail_service():
-    creds = None
-
-    # Load existing token
-    if os.path.exists(TOKEN_FILE):
-        try:
-            creds = Credentials.from_authorized_user_file(
-                TOKEN_FILE,
-                SCOPES
-            )
-        except Exception as e:
-            print("Failed to load Gmail token:", e)
-            creds = None
-
-    # Refresh or create credentials
-    if not creds or not creds.valid:
-
-        # Refresh existing credentials
-        if creds and creds.expired and creds.refresh_token:
-            try:
-                creds.refresh(Request())
-                print("Gmail token refreshed successfully.")
-
-            except Exception as e:
-                print("Failed to refresh Gmail token:", e)
-                creds = None
-
-        # Start OAuth flow if no valid credentials
-        if not creds or not creds.valid:
-
-            if not os.path.exists(CREDENTIALS_FILE):
-                raise FileNotFoundError(
-                    f"Google credentials file not found: {CREDENTIALS_FILE}"
-                )
-
-            flow = InstalledAppFlow.from_client_secrets_file(
-                CREDENTIALS_FILE,
-                SCOPES
-            )
-
-            creds = flow.run_local_server(port=0)
-
-        # Save credentials
-        try:
-            token_directory = os.path.dirname(TOKEN_FILE)
-
-            if token_directory:
-                os.makedirs(token_directory, exist_ok=True)
-
-            with open(TOKEN_FILE, "w") as token:
-                token.write(creds.to_json())
-
-            print("Gmail token saved successfully.")
-
-        except Exception as e:
-            print("Failed to save Gmail token:", e)
-
-    # Build Gmail API service
-    return build(
-        "gmail",
-        "v1",
-        credentials=creds
-    )
+    """Build a Gmail API client (with a request timeout)."""
+    creds = get_credentials()
+    http = google_auth_httplib2.AuthorizedHttp(creds, http=httplib2.Http(timeout=HTTP_TIMEOUT_SECONDS))
+    return build("gmail", "v1", http=http, cache_discovery=False)
 
 
-# ============================================================
-# EMAIL BODY EXTRACTION
-# ============================================================
+# ----------------------------------------------------------------------
+# calling Gmail safely
+# ----------------------------------------------------------------------
 
-def get_email_body(payload):
-    """
-    Extract plain-text body from a Gmail message.
-    """
-
-    mime_type = payload.get("mimeType", "")
-
-    # Prefer plain text
-    if mime_type == "text/plain":
-
-        body_data = payload.get("body", {}).get("data")
-
-        if body_data:
-            try:
-                return base64.urlsafe_b64decode(
-                    body_data
-                ).decode(
-                    "utf-8",
-                    errors="ignore"
-                )
-            except Exception as e:
-                print("Failed to decode email body:", e)
-
-    # Search multipart sections recursively
-    for part in payload.get("parts", []):
-
-        body = get_email_body(part)
-
-        if body:
-            return body
-
-    return ""
+def _execute(request):
+    """Run a Gmail request, retrying transient errors and translating failures."""
+    try:
+        return request.execute(num_retries=2)
+    except HttpError as exc:
+        status = getattr(exc.resp, "status", None)
+        logger.warning("Gmail API error (status %s).", status)
+        if status in (401, 403):
+            message = ("Gmail rejected the request. Check that the Gmail API is enabled and "
+                       "that the token has the gmail.modify scope.")
+        elif status == 429:
+            message = "Gmail rate limit reached. Try again in a minute."
+        elif status == 404:
+            message = "Gmail message not found."
+        else:
+            message = f"Gmail API error (status {status})."
+        raise GmailAPIError(message, status) from exc
+    except RefreshError as exc:
+        raise GmailAuthError("Gmail authorisation expired or was revoked.") from exc
+    except (OSError, httplib2.HttpLib2Error) as exc:
+        logger.warning("Network problem talking to Gmail: %s", type(exc).__name__)
+        raise GmailAPIError("Could not reach Gmail. Try again shortly.") from exc
 
 
-# ============================================================
-# GET EMAIL HEADER
-# ============================================================
+# ----------------------------------------------------------------------
+# parsing a Gmail message
+# ----------------------------------------------------------------------
 
-def get_header(headers, header_name):
-    """
-    Get a specific Gmail header value.
-    """
-
+def get_header(headers: List[Dict[str, str]], header_name: str) -> str:
     header_name = header_name.lower()
-
     for header in headers:
-
         if header.get("name", "").lower() == header_name:
             return header.get("value", "")
-
     return ""
 
 
-# ============================================================
-# GET EMAILS
-# ============================================================
+def _decode_part(part: Dict[str, Any]) -> str:
+    data = part.get("body", {}).get("data")
+    if not data:
+        return ""
+    try:
+        # Gmail often omits base64 padding; add it or decoding fails.
+        raw = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+    except (ValueError, TypeError):
+        logger.warning("Could not base64-decode an email part.")
+        return ""
 
-def get_emails(max_results=5):
+    content_type = get_header(part.get("headers", []), "Content-Type")
+    match = re.search(r'charset="?([\w\-]+)', content_type, flags=re.I)
+    charset = match.group(1) if match else "utf-8"
+    try:
+        return raw.decode(charset, errors="replace")
+    except LookupError:
+        return raw.decode("utf-8", errors="replace")
 
+
+def _find_part_text(payload: Dict[str, Any], mime_type: str) -> str:
+    """Depth-first search for the first non-empty part of the given MIME type."""
+    if payload.get("mimeType", "") == mime_type:
+        text = _decode_part(payload)
+        if text.strip():
+            return text
+    for part in payload.get("parts", []) or []:
+        text = _find_part_text(part, mime_type)
+        if text.strip():
+            return text
+    return ""
+
+
+def get_email_body(payload: Dict[str, Any]) -> str:
+    """Prefer text/plain; fall back to text/html (HTML-only emails are common)."""
+    return _find_part_text(payload, "text/plain") or _find_part_text(payload, "text/html")
+
+
+def parse_message(message: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert a raw Gmail API message into the dict we store."""
+    payload = message.get("payload", {})
+    headers = payload.get("headers", [])
+
+    sender = get_header(headers, "From")
+    labels = message.get("labelIds", []) or []
+
+    try:
+        internal_date = int(message.get("internalDate", 0))
+    except (TypeError, ValueError):
+        internal_date = 0
+
+    date_header = get_header(headers, "Date")
+    if not date_header and internal_date:
+        date_header = datetime.fromtimestamp(internal_date / 1000, tz=timezone.utc).isoformat()
+
+    body = clean_email_body(get_email_body(payload))[: settings.MAX_BODY_CHARS]
+
+    return {
+        "id": message["id"],
+        "thread_id": message.get("threadId"),
+        "sender": sender,
+        "sender_email": parseaddr(sender)[1],
+        "subject": get_header(headers, "Subject"),
+        "date": date_header,
+        "internal_date": internal_date,
+        "snippet": message.get("snippet", ""),
+        "body": body,
+        "labels": labels,
+        "unread": "UNREAD" in labels,
+    }
+
+
+# ----------------------------------------------------------------------
+# public functions
+# ----------------------------------------------------------------------
+
+def list_message_ids(service, max_results: int, query: Optional[str] = None) -> List[str]:
+    """Return up to `max_results` message ids (newest first), following pagination."""
+    ids: List[str] = []
+    page_token = None
+
+    while len(ids) < max_results:
+        params: Dict[str, Any] = {
+            "userId": "me",
+            "maxResults": min(PAGE_SIZE, max_results - len(ids)),
+        }
+        if query:
+            params["q"] = query
+        if page_token:
+            params["pageToken"] = page_token
+
+        response = _execute(service.users().messages().list(**params))
+        ids.extend(m["id"] for m in response.get("messages", []))
+
+        page_token = response.get("nextPageToken")
+        if not page_token:
+            break
+
+    return ids[:max_results]
+
+
+def fetch_email(service, message_id: str) -> Dict[str, Any]:
+    """Download and parse one message."""
+    raw = _execute(service.users().messages().get(userId="me", id=message_id, format="full"))
+    return parse_message(raw)
+
+
+def get_emails(max_results: int = 5) -> List[Dict[str, Any]]:
+    """
+    Fetch and parse recent emails WITHOUT saving or classifying them
+    (used by scripts/check_gmail.py).
+    """
     service = get_gmail_service()
-
-    # Get message IDs
-    results = (
-        service.users()
-        .messages()
-        .list(
-            userId="me",
-            maxResults=max_results
-        )
-        .execute()
-    )
-
-    messages = results.get("messages", [])
-
     emails = []
-
-    for message in messages:
-
+    for message_id in list_message_ids(service, max_results, settings.GMAIL_QUERY):
         try:
-
-            # Get complete email
-            email = (
-                service.users()
-                .messages()
-                .get(
-                    userId="me",
-                    id=message["id"],
-                    format="full"
-                )
-                .execute()
-            )
-
-            payload = email.get("payload", {})
-
-            headers = payload.get("headers", [])
-
-            # Extract headers
-            sender = get_header(headers, "From")
-            subject = get_header(headers, "Subject")
-            date = get_header(headers, "Date")
-
-            # Extract body
-            body = get_email_body(payload)
-
-            # Clean body
-            body = clean_email_body(body)
-
-            # Check unread status
-            label_ids = email.get("labelIds", [])
-
-            unread = "UNREAD" in label_ids
-
-            # Create email object
-            email_data = {
-                "id": message["id"],
-                "sender": sender,
-                "subject": subject,
-                "date": date,
-                "body": body,
-                "unread": unread
-            }
-
-            # ====================================================
-            # AI CLASSIFICATION
-            # ====================================================
-
-            try:
-
-                classification = classify_email(email_data)
-
-                if classification:
-                    email_data.update(classification)
-
-            except Exception as e:
-
-                print(
-                    "AI classification failed:",
-                    e
-                )
-
-            # ====================================================
-            # SAVE TO MONGODB
-            # ====================================================
-
-            try:
-
-                save_email(email_data)
-
-            except Exception as e:
-
-                print(
-                    "Failed to save email to MongoDB:",
-                    e
-                )
-
-            emails.append(email_data)
-
-        except Exception as e:
-
-            print(
-                f"Failed to process email {message.get('id')}:",
-                e
-            )
-
+            emails.append(fetch_email(service, message_id))
+        except GmailAPIError as exc:
+            logger.warning("Skipping email %s: %s", message_id, exc)
     return emails
 
 
-# ============================================================
-# MARK EMAIL AS READ
-# ============================================================
-
-def mark_email_as_read(email_id):
-
-    service = get_gmail_service()
-
+def mark_email_as_read(email_id: str) -> bool:
+    """Remove the UNREAD label in Gmail. Returns True on success, never raises."""
     try:
-
-        service.users().messages().modify(
-            userId="me",
-            id=email_id,
-            body={
-                "removeLabelIds": ["UNREAD"]
-            }
-        ).execute()
-
-        return True
-
-    except Exception as e:
-
-        print(
-            f"Failed to mark email {email_id} as read:",
-            e
+        service = get_gmail_service()
+        _execute(
+            service.users().messages().modify(
+                userId="me", id=email_id, body={"removeLabelIds": ["UNREAD"]}
+            )
         )
-
+        return True
+    except (GmailAuthError, GmailAPIError) as exc:
+        logger.warning("Could not mark email %s as read in Gmail: %s", email_id, exc)
         return False

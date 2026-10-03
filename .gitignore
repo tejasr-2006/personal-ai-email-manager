@@ -1,8 +1,26 @@
-venv/
+# --- secrets (never commit) ---
 .env
+.env.*
+!.env.example
 credentials.json
 token.json
+client_secret*.json
+*.pem
+
+# --- python ---
+venv/
+.venv/
+env/
 __pycache__/
 *.pyc
+.pytest_cache/
+
+# --- node ---
 node_modules/
 dist/
+
+# --- misc ---
+*.log
+.DS_Store
+.idea/
+.vscode/
