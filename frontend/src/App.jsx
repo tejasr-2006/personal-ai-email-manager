@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import axios from "axios";
 import "./App.css";
 
-const API = import.meta.env.BACKEND_URL;
+const API = import.meta.env.VITE_API_URL;
 
 /* ---------- small UI helpers ---------- */
 const P = {
