@@ -14,7 +14,7 @@ import "./AuthGate.css";
   - The real enforcement is in FastAPI; this screen only decides what to show.
 */
 
-const API = import.meta.env.VITE_API_URL;
+const API = import.meta.env.BACKEND_URL;
 
 // Send the session cookie on every request to the backend (cross-site: Vercel -> Render).
 axios.defaults.withCredentials = true;
