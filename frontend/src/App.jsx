@@ -19,6 +19,7 @@ const P = {
   tag: '<path d="M20 12 12 20 4 12V4h8z"/><circle cx="8.5" cy="8.5" r="1"/>',
   moon: '<path d="M21 13A9 9 0 1 1 11 3a7 7 0 0 0 10 10z"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/>',
+  logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9"/>',
   alert: '<path d="M12 9v4M12 17h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>',
 };
 const Icon = ({ n, s = 16 }) => (
@@ -27,6 +28,16 @@ const Icon = ({ n, s = 16 }) => (
 const AIBadge = ({ children }) => (
   <span className="ai"><Icon n="spark" s={12} />{children}</span>
 );
+// Say what is really wrong instead of always blaming "the backend is not running".
+const errorMessage = (err, fallback) => {
+  const code = err?.response?.status;
+  const detail = typeof err?.response?.data?.detail === "string" ? err.response.data.detail : "";
+  if (code === 401) return "Please log in";
+  if (code === 403) return "You are not authorized";
+  if (code >= 500) return `Backend/server error${detail ? `: ${detail}` : ""}`;
+  if (!err?.response) return "Cannot reach the backend. Check your connection and that the server is running.";
+  return detail || fallback;
+};
 const cap = (s = "") => s.charAt(0).toUpperCase() + s.slice(1);
 const fmtDate = (d) => {
   if (!d) return "";
@@ -71,7 +82,7 @@ const TITLES = {
   deadlines: ["Deadlines", "Emails with a date attached"],
 };
 
-function App() {
+function App({ onLogout }) {
   // ---------- STATE (unchanged) ----------
   const [emails, setEmails] = useState([]);
   const [filter, setFilter] = useState("all");
@@ -147,7 +158,7 @@ function App() {
       return emailList;
     } catch (err) {
       console.error("Failed to load emails:", err);
-      setError("Failed to load emails. Make sure the backend is running.");
+      setError(errorMessage(err, "Failed to load emails."));
       return [];
     } finally {
       if (showLoading) setLoading(false);
@@ -209,8 +220,9 @@ function App() {
       toast("Inbox synced");
     } catch (err) {
       console.error("Email sync failed:", err);
-      setError("Email sync failed. Check whether the backend is running.");
-      toast("Sync failed. Check that the backend is running.", "err");
+      const message = errorMessage(err, "Email sync failed.");
+      setError(message);
+      toast(message, "err");
     } finally {
       setSyncing(false);
     }
@@ -228,7 +240,7 @@ function App() {
     } catch (err) {
       console.error("Failed to generate briefing:", err);
       setBriefingError(true);
-      toast("Could not generate the briefing", "err");
+      toast(errorMessage(err, "Could not generate the briefing"), "err");
     } finally {
       setBriefingLoading(false);
     }
@@ -329,6 +341,11 @@ function App() {
         <button className="nav" onClick={() => setTheme(theme === "dark" ? "light" : "dark")}>
           <Icon n={theme === "dark" ? "sun" : "moon"} />{theme === "dark" ? "Light mode" : "Dark mode"}
         </button>
+        {onLogout && (
+          <button className="nav" onClick={onLogout}>
+            <Icon n="logout" />Log out
+          </button>
+        )}
       </aside>
       {menuOpen && <div className="scrim" onClick={() => setMenuOpen(false)} />}
 
@@ -343,7 +360,7 @@ function App() {
           <button className="btn p" onClick={syncEmails} disabled={syncing}>
             {syncing ? <i className="spin" /> : <Icon n="refresh" />}<span>{syncing ? "Syncing…" : "Sync Gmail"}</span>
           </button>
-          <div className="status" title={error ? "Backend unreachable" : "Connected"}>
+          <div className="status" title={error || "Connected"}>
             <i className={`dot ${error ? "bad" : ""}`} /><span>{error ? "Offline" : "Gmail connected"}</span>
           </div>
         </header>

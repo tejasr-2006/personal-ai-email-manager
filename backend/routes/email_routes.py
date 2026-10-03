@@ -26,14 +26,14 @@ from models.email import (
 )
 from services import ai_service, gmail_service, mongodb_service, sync_service
 from utils.logger import get_logger
-from utils.security import require_api_key
+from utils.security import require_auth
 
 logger = get_logger(__name__)
 
 router = APIRouter(
     prefix="/emails",
     tags=["Emails"],
-    dependencies=[Depends(require_api_key)],
+    dependencies=[Depends(require_auth)],
 )
 
 LimitQuery = Query(default=None, ge=1, le=5000, description="Maximum emails to return")

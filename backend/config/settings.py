@@ -95,8 +95,20 @@ class Settings:
 
     # --- CORS / API protection ---
     ALLOWED_ORIGINS: List[str] = field(default_factory=lambda: list(DEFAULT_DEV_ORIGINS))
-    ALLOWED_ORIGIN_REGEX: str = ""
+    ORIGINS_CONFIGURED: bool = False
+    WILDCARD_ORIGIN_REMOVED: bool = False
+    # Server-to-server key (X-API-Key). It is NEVER sent to the browser.
     API_KEY: str = ""
+
+    # --- login / session (browser authentication) ---
+    AUTH_PASSWORD: str = ""
+    SESSION_SECRET: str = ""
+    SESSION_COOKIE_NAME: str = "eml_session"
+    SESSION_MAX_AGE_SECONDS: int = 86_400          # absolute lifetime: 24 hours
+    COOKIE_SECURE: bool = False
+    COOKIE_SAMESITE: str = "lax"                   # "none" | "lax" | "strict"
+    LOGIN_MAX_FAILURES: int = 10
+    LOGIN_LOCKOUT_SECONDS: int = 900
 
     # --- MongoDB ---
     MONGODB_URI: str = ""
@@ -128,24 +140,51 @@ class Settings:
         return self.ENVIRONMENT.lower() == "production"
 
     @property
+    def auth_configured(self) -> bool:
+        """Login only works with a password AND a long random session secret."""
+        return bool(self.AUTH_PASSWORD) and len(self.SESSION_SECRET) >= 32
+
+    @property
     def secret_values(self) -> List[str]:
         """Literal secrets, used by the log formatter to redact them."""
-        values = [self.MONGODB_URI, self.GEMINI_API_KEY, self.API_KEY, self.GOOGLE_TOKEN_JSON]
+        values = [
+            self.MONGODB_URI, self.GEMINI_API_KEY, self.API_KEY, self.GOOGLE_TOKEN_JSON,
+            self.AUTH_PASSWORD, self.SESSION_SECRET,
+        ]
         return [v for v in values if v and len(v) >= 8]
 
 
 def load_settings() -> Settings:
     environment = _get_str("ENVIRONMENT", _get_str("ENV", "development")).lower()
-    origins_were_set = bool(_get_str("ALLOWED_ORIGINS"))
+    origins = _get_list("ALLOWED_ORIGINS", DEFAULT_DEV_ORIGINS)
+    # Cookies + "*" would let any website talk to the API as the logged-in user.
+    wildcard_removed = "*" in origins
+    origins = [o for o in origins if o != "*"]
+
+    # SameSite=None is required for a Vercel -> Render (cross-site) cookie, and
+    # browsers only accept it together with Secure.
+    samesite = _get_str("COOKIE_SAMESITE", "none" if environment == "production" else "lax").lower()
+    if samesite not in {"none", "lax", "strict"}:
+        samesite = "lax"
+    cookie_secure = _get_bool("COOKIE_SECURE", environment == "production") or samesite == "none"
 
     settings = Settings(
         ENVIRONMENT=environment,
         LOG_LEVEL=_get_str("LOG_LEVEL", "INFO").upper(),
         PORT=_get_int("PORT", 8000, 1, 65535),
         ENABLE_DOCS=_get_bool("ENABLE_DOCS", environment != "production"),
-        ALLOWED_ORIGINS=_get_list("ALLOWED_ORIGINS", DEFAULT_DEV_ORIGINS),
-        ALLOWED_ORIGIN_REGEX=_get_str("ALLOWED_ORIGIN_REGEX"),
+        ALLOWED_ORIGINS=origins,
+        ORIGINS_CONFIGURED=bool(_get_str("ALLOWED_ORIGINS")),
+        WILDCARD_ORIGIN_REMOVED=wildcard_removed,
         API_KEY=_get_str("API_KEY"),
+        AUTH_PASSWORD=os.getenv("AUTH_PASSWORD", ""),   # not stripped: spaces may be intentional
+        SESSION_SECRET=_get_str("SESSION_SECRET"),
+        SESSION_COOKIE_NAME=_get_str("SESSION_COOKIE_NAME", "eml_session"),
+        SESSION_MAX_AGE_SECONDS=_get_int("SESSION_MAX_AGE_SECONDS", 86_400, 300, 2_592_000),
+        COOKIE_SECURE=cookie_secure,
+        COOKIE_SAMESITE=samesite,
+        LOGIN_MAX_FAILURES=_get_int("LOGIN_MAX_FAILURES", 10, 3, 1000),
+        LOGIN_LOCKOUT_SECONDS=_get_int("LOGIN_LOCKOUT_SECONDS", 900, 60, 86_400),
         MONGODB_URI=_get_str("MONGODB_URI"),
         MONGODB_DB_NAME=_get_str("MONGODB_DB_NAME", "personal_ai_email"),
         MONGODB_COLLECTION=_get_str("MONGODB_COLLECTION", "emails"),
@@ -164,7 +203,6 @@ def load_settings() -> Settings:
         MAX_BODY_CHARS=_get_int("MAX_BODY_CHARS", 10_000, 500, 100_000),
         LIST_DEFAULT_LIMIT=_get_int("LIST_DEFAULT_LIMIT", 500, 1, 5000),
     )
-    settings._origins_were_set = origins_were_set  # used only for a startup warning
     return settings
 
 

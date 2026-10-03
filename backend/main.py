@@ -16,6 +16,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.gzip import GZipMiddleware
 
 from config.settings import settings
+from routes.auth_routes import router as auth_router
 from routes.email_routes import router as email_router
 from routes.health_routes import router as health_router
 from services import gmail_service, mongodb_service
@@ -42,10 +43,19 @@ async def lifespan(app: FastAPI):
         logger.warning("GEMINI_API_KEY is not set - emails will use the keyword fallback classifier.")
     if not gmail_service.is_configured():
         logger.warning("Gmail is not authorised - run `python scripts/gmail_auth.py` (see README).")
-    if not settings.API_KEY:
-        logger.warning("API_KEY is not set - the email API is open to anyone who can reach it.")
-    if settings.is_production and not getattr(settings, "_origins_were_set", False):
-        logger.warning("ALLOWED_ORIGINS is not set in production - only localhost origins are allowed.")
+    if not settings.auth_configured:
+        logger.error(
+            "AUTH_PASSWORD and/or SESSION_SECRET (min 32 chars) are missing - login is disabled "
+            "and every /emails request will be answered with 401."
+        )
+    elif len(settings.AUTH_PASSWORD) < 12:
+        logger.warning("AUTH_PASSWORD is shorter than 12 characters - use a longer one.")
+    if settings.WILDCARD_ORIGIN_REMOVED:
+        logger.error("ALLOWED_ORIGINS contained '*'. It was ignored: cookies require explicit origins.")
+    if settings.is_production and not settings.ORIGINS_CONFIGURED:
+        logger.error("ALLOWED_ORIGINS is not set in production - your frontend will be blocked by CORS.")
+    if settings.is_production and not settings.COOKIE_SECURE:
+        logger.warning("COOKIE_SECURE is off in production - set it to true.")
 
     # Try to connect now so problems show up in the logs immediately,
     # but never crash the server if MongoDB is temporarily down.
@@ -81,21 +91,28 @@ app = FastAPI(
 @app.middleware("http")
 async def catch_unhandled_errors(request: Request, call_next):
     try:
-        return await call_next(request)
+        response = await call_next(request)
     except Exception:
         logger.exception("Unhandled error on %s %s", request.method, request.url.path)
-        return JSONResponse(status_code=500, content={"detail": "Internal server error."})
+        response = JSONResponse(status_code=500, content={"detail": "Internal server error."})
+
+    # Private data must never be stored by browsers or proxies.
+    if request.url.path.startswith(("/emails", "/auth", "/status")):
+        response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
+# Cookie login => credentials allowed, so origins MUST be an explicit list
+# (never "*"). Only your own frontend URL(s) from ALLOWED_ORIGINS are accepted.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.ALLOWED_ORIGINS,
-    allow_origin_regex=settings.ALLOWED_ORIGIN_REGEX or None,
-    allow_credentials=False,
+    allow_credentials=True,
     allow_methods=["GET", "POST", "PATCH", "OPTIONS"],
-    allow_headers=["*"],
+    allow_headers=["Content-Type", "Accept"],
 )
 
 
@@ -103,13 +120,13 @@ app.add_middleware(
 # ERROR HANDLERS  (always JSON: {"detail": "..."})
 # ============================================================
 
-def _error(status_code: int, detail: str) -> JSONResponse:
-    return JSONResponse(status_code=status_code, content={"detail": detail})
+def _error(status_code: int, detail: str, headers=None) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"detail": detail}, headers=headers)
 
 
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
-    return _error(exc.status_code, str(exc.detail))
+    return _error(exc.status_code, str(exc.detail), getattr(exc, "headers", None))
 
 
 @app.exception_handler(RequestValidationError)
@@ -146,6 +163,7 @@ async def ai_service_handler(request: Request, exc: AIServiceError):
 # ============================================================
 
 app.include_router(health_router)   # GET /, /healthz, /status
+app.include_router(auth_router)     # /auth/login, /auth/me, /auth/logout
 app.include_router(email_router)    # /emails/...
 
 

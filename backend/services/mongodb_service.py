@@ -25,6 +25,7 @@ logger = get_logger(__name__)
 _client: Optional[MongoClient] = None
 _client_lock = threading.Lock()
 _indexes_ready = False
+_sessions_ready = False
 
 
 class DatabaseUnavailable(Exception):
@@ -73,6 +74,24 @@ def get_collection():
         raise DatabaseUnavailable("Database is temporarily unavailable.") from exc
 
 
+def get_sessions_collection():
+    """Login sessions. Expired ones are removed by MongoDB itself (TTL index)."""
+    global _sessions_ready
+
+    try:
+        collection = get_client()[settings.MONGODB_DB_NAME]["sessions"]
+        if not _sessions_ready:
+            collection.create_index("sid_hash", unique=True, name="uniq_sid_hash")
+            collection.create_index("expires_at", expireAfterSeconds=0, name="ttl_expires_at")
+            _sessions_ready = True
+        return collection
+    except DatabaseUnavailable:
+        raise
+    except PyMongoError as exc:
+        logger.error("MongoDB sessions problem: %s: %s", type(exc).__name__, exc)
+        raise DatabaseUnavailable("Database is temporarily unavailable.") from exc
+
+
 def db_guard(func):
     """Convert any PyMongo error into DatabaseUnavailable."""
 
@@ -96,12 +115,13 @@ def ping() -> bool:
 
 
 def close_client() -> None:
-    global _client, _indexes_ready
+    global _client, _indexes_ready, _sessions_ready
     with _client_lock:
         if _client is not None:
             _client.close()
         _client = None
         _indexes_ready = False
+        _sessions_ready = False
 
 
 # ----------------------------------------------------------------------

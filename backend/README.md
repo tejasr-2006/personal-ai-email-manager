@@ -4,10 +4,11 @@
 backend/
 ├── main.py                  app setup: CORS, error handlers, startup
 ├── config/settings.py       ALL configuration, read from environment variables
-├── routes/                  HTTP endpoints (email_routes.py, health_routes.py)
+├── routes/                  HTTP endpoints (email_routes.py, auth_routes.py, health_routes.py)
 ├── services/
 │   ├── gmail_service.py     talks to Gmail (OAuth, pagination, parsing)
 │   ├── ai_service.py        Gemini classification + briefing + validation + fallback
+│   ├── auth_service.py      login password check + server-side sessions
 │   ├── mongodb_service.py   the only file that touches MongoDB
 │   └── sync_service.py      Gmail -> AI -> MongoDB, without duplicates
 ├── models/email.py          validation + response models
@@ -78,25 +79,64 @@ and prints a one-line `GOOGLE_TOKEN_JSON=...` for Render.
 | `MONGODB_URI` | yes | MongoDB Atlas connection string |
 | `GEMINI_API_KEY` | yes (else keyword fallback is used) | Google AI Studio key |
 | `GOOGLE_TOKEN_JSON` | yes on Render | one-line token JSON from `gmail_auth.py` (locally `token.json` is used) |
-| `ALLOWED_ORIGINS` | yes in production | comma-separated frontend URLs, no trailing slash |
+| `AUTH_PASSWORD` | **yes** | the password you type on the login page (12+ characters) |
+| `SESSION_SECRET` | **yes** | random, 32+ characters: `python -c "import secrets; print(secrets.token_urlsafe(48))"` |
+| `ALLOWED_ORIGINS` | **yes** in production | your exact frontend URL, e.g. `https://personal-ai-email-manager.vercel.app` (no trailing slash, never `*`) |
 | `ENVIRONMENT` | recommended | `production` on Render (hides `/docs`) |
-| `API_KEY` | recommended | if set, `/emails/*` needs header `X-API-Key` |
+| `API_KEY` | optional | server-to-server key (`X-API-Key` header) for scripts; the browser never gets it |
+| `SESSION_MAX_AGE_SECONDS` | optional | login lifetime, default 86400 (24 h) |
 | `MONGODB_DB_NAME`, `GEMINI_MODEL`, `GMAIL_QUERY`, `SYNC_MAX_EMAILS`, `LOG_LEVEL`, ... | no | see `.env.example` |
 
 ## API
 
+**Everything except `/`, `/healthz` and `/auth/login|logout` requires a login** (session cookie)
+or the server-side `X-API-Key`. Unauthenticated requests get `401`.
+
+
 | Method | Path | Notes |
 |---|---|---|
 | GET | `/`, `/healthz` | liveness (Render health check) |
-| GET | `/status` | database / gmail / gemini configured? |
+| POST | `/auth/login` | body `{"password": "..."}` → sets the HttpOnly session cookie |
+| GET | `/auth/me` | 200 if logged in, else 401 |
+| POST | `/auth/logout` | deletes the session on the server and clears the cookie |
+| GET | `/status` | database / gmail / gemini configured? (login required) |
 | GET | `/emails/` | list, newest first (optional `?limit=`) |
 | GET | `/emails/high-priority`, `/emails/action-required`, `/emails/category/{category}` | filtered lists |
 | GET | `/emails/briefing` | `{"briefing": "..."}` |
 | POST | `/emails/sync` | optional `?max_results=1..100`; returns `count` (new emails) + details |
 | PATCH | `/emails/{id}/read` | marks read in MongoDB and Gmail |
 
-Errors are always `{"detail": "..."}`: `401` bad API key, `404` unknown email, `422` invalid input,
+Errors are always `{"detail": "..."}`: `401` not logged in / wrong password, `403` request from a foreign origin, `429` too many failed logins, `404` unknown email, `422` invalid input,
 `502` Gmail problem, `503` MongoDB / Gmail-auth / AI unavailable.
+
+## How login works (security model)
+
+```text
+Browser (Vercel)  --POST /auth/login {password}-->  FastAPI (Render)
+                  <--Set-Cookie: eml_session (HttpOnly, Secure, SameSite=None)--
+Browser           --GET /emails/ + cookie-------->  FastAPI --> Gmail / MongoDB / Gemini
+```
+
+* The password is checked **on the server** against `AUTH_PASSWORD`. Nothing secret exists in the frontend.
+* The session is a random 256-bit token in an **HttpOnly** cookie (JavaScript cannot read it, so XSS
+  cannot steal it). MongoDB stores only an HMAC hash of it (`sessions` collection, auto-deleted on expiry).
+* **Logout** deletes the session on the server. Changing `SESSION_SECRET` logs everyone out.
+* Because the production cookie is `SameSite=None` (needed for Vercel → Render), state-changing requests
+  are also checked against `ALLOWED_ORIGINS` (CSRF protection), and CORS only allows your own frontend.
+* 10 wrong passwords in 15 minutes locks logins for 15 minutes (a global limit: this is a one-user app).
+* Gmail token, MongoDB URI, Gemini key, `API_KEY`, `SESSION_SECRET`, `AUTH_PASSWORD` exist only in Render's environment.
+
+**Browser caveat:** `vercel.app` and `onrender.com` are different *sites*, so this cookie is a "third-party"
+cookie. Chrome and Firefox accept it, but **Safari (and iPhone browsers) block it by default** and login
+will appear to succeed and then fail. The fix is to make the API same-site, either with a custom domain
+(`app.yourdomain.com` + `api.yourdomain.com`, then `COOKIE_SAMESITE=lax`) or by proxying through Vercel:
+add `frontend/vercel.json`
+
+```json
+{ "rewrites": [{ "source": "/api/:path*", "destination": "https://YOUR-BACKEND.onrender.com/:path*" }] }
+```
+
+set `VITE_API_URL=/api` on Vercel and `COOKIE_SAMESITE=lax` on Render (keep `ALLOWED_ORIGINS` as your Vercel URL).
 
 ## Deploy on Render
 
@@ -104,8 +144,9 @@ Errors are always `{"detail": "..."}`: `401` bad API key, `404` unknown email, `
 3. Settings: **Root Directory** `backend` · **Build** `pip install -r requirements.txt` ·
    **Start** `uvicorn main:app --host 0.0.0.0 --port $PORT` · **Health Check Path** `/healthz`.
    (Or use **New + → Blueprint**, which reads `render.yaml`.)
-4. Environment: set the variables in the table above plus `PYTHON_VERSION=3.12.3`.
+4. Environment: set the variables in the table above (at least `MONGODB_URI`, `GEMINI_API_KEY`, `GOOGLE_TOKEN_JSON`,
+   `AUTH_PASSWORD`, `SESSION_SECRET`, `ALLOWED_ORIGINS`, `ENVIRONMENT=production`) plus `PYTHON_VERSION=3.12.3`.
 5. MongoDB Atlas → Network Access: allow Render's IPs (simplest: `0.0.0.0/0` with a strong DB password).
-6. Frontend: set `VITE_API_URL=https://<your-service>.onrender.com`, and put the frontend's URL in `ALLOWED_ORIGINS`.
+6. Vercel: the **only** variable is `VITE_API_URL=https://<your-service>.onrender.com` (no key, no secret). Then redeploy.
 
 Free Render services sleep when idle; the first request after a pause can take ~30–60 s.

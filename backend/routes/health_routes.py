@@ -2,11 +2,12 @@
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
 from config.settings import settings
 from services import gmail_service, mongodb_service
 from services.mongodb_service import DatabaseUnavailable
+from utils.security import require_auth
 
 router = APIRouter(tags=["Health"])
 
@@ -32,9 +33,9 @@ def healthz():
     }
 
 
-@router.get("/status")
+@router.get("/status", dependencies=[Depends(require_auth)])
 def status():
-    """Deeper check: is each dependency configured and reachable?"""
+    """Deeper check (login required): is each dependency configured and reachable?"""
     if not settings.MONGODB_URI:
         database = "not_configured"
     else:
@@ -48,7 +49,7 @@ def status():
         "database": database,
         "gmail": "configured" if gmail_service.is_configured() else "not_authorised",
         "gemini": "configured" if settings.GEMINI_API_KEY else "not_configured",
-        "api_key_protection": "enabled" if settings.API_KEY else "disabled",
+        "login": "configured" if settings.auth_configured else "not_configured",
     }
     healthy = database == "connected" and checks["gmail"] == "configured" and checks["gemini"] == "configured"
     return {"status": "ok" if healthy else "degraded", "service": SERVICE_NAME, "checks": checks}
